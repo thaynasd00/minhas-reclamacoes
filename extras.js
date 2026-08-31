@@ -1,0 +1,93 @@
+function buildComplaintEmail(c){
+  const lines=[
+    'Resumo da reclamação',
+    '',
+    `Empresa: ${c.company||'—'}`,
+    `Assunto: ${c.subject||'—'}`,
+    `Reclamante: ${c.claimant_name||'—'}`,
+    `Status: ${c.status||'—'}`,
+    `Plataforma: ${c.platform||'—'}`,
+    `Protocolo: ${c.protocol||'—'}`,
+    `Data: ${fmt(c.complaint_date)}`,
+    `Prazo: ${fmt(c.deadline)}`,
+    `Valor envolvido: ${money(c.amount_involved)}`,
+    `Valor recuperado: ${money(c.amount_recovered)}`,
+    `Próxima ação: ${c.next_action||'—'}`,
+    '',
+    'Observações:',
+    c.notes||'—'
+  ];
+  return lines.join('\n');
+}
+
+function emailComplaint(id){
+  const c=complaints.find(x=>x.id===id); if(!c)return;
+  const to=prompt('Para qual e-mail deseja enviar o resumo?')||'';
+  if(!to)return;
+  const subject=`Reclamação - ${c.company} - ${c.subject}`;
+  const body=buildComplaintEmail(c);
+  window.location.href=`mailto:${encodeURIComponent(to)}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+}
+
+async function uploadAttachments(cid,input){
+  const files=[...(input.files||[])];
+  if(!files.length)return;
+  for(const file of files){
+    if(!['image/jpeg','image/png','image/webp'].includes(file.type)){
+      alert(`O arquivo ${file.name} não é uma imagem JPG, PNG ou WEBP.`); continue;
+    }
+    if(file.size>10*1024*1024){
+      alert(`O arquivo ${file.name} ultrapassa 10 MB.`); continue;
+    }
+    const safeName=file.name.replace(/[^a-zA-Z0-9._-]+/g,'_');
+    const path=`${user.id}/${cid}/${crypto.randomUUID()}-${safeName}`;
+    const up=await db.storage.from('complaint-prints').upload(path,file,{contentType:file.type,upsert:false});
+    if(up.error){alert(`Não foi possível enviar ${file.name}: ${up.error.message}`);continue;}
+    const ins=await db.from('complaint_attachments').insert({
+      user_id:user.id, complaint_id:cid, storage_path:path, file_name:file.name,
+      mime_type:file.type, file_size:file.size
+    });
+    if(ins.error){
+      await db.storage.from('complaint-prints').remove([path]);
+      alert(`Não foi possível salvar o anexo ${file.name}: ${ins.error.message}`);
+    }
+  }
+  input.value='';
+  await openDetail(cid);
+}
+
+async function openAttachment(id){
+  const r=await db.from('complaint_attachments').select('*').eq('id',id).single();
+  if(r.error||!r.data){alert('Não foi possível abrir o print.');return;}
+  const win=window.open('','_blank');
+  const s=await db.storage.from('complaint-prints').createSignedUrl(r.data.storage_path,300);
+  if(s.error||!s.data?.signedUrl){if(win)win.close();alert('Não foi possível gerar o acesso ao print.');return;}
+  if(win)win.location=s.data.signedUrl; else window.location.href=s.data.signedUrl;
+}
+
+async function deleteAttachment(id,cid,path){
+  if(!confirm('Excluir este print?'))return;
+  const st=await db.storage.from('complaint-prints').remove([path]);
+  if(st.error){alert(st.error.message);return;}
+  const r=await db.from('complaint_attachments').delete().eq('id',id);
+  if(r.error){alert(r.error.message);return;}
+  await openDetail(cid);
+}
+
+openDetail=async function(id){
+  const c=complaints.find(x=>x.id===id);if(!c)return;
+  const [tr,at]=await Promise.all([
+    db.from('timeline_events').select('*').eq('complaint_id',id).order('event_date',{ascending:true}).order('created_at',{ascending:true}),
+    db.from('complaint_attachments').select('*').eq('complaint_id',id).order('created_at',{ascending:false})
+  ]);
+  const attachments=at.data||[];
+  $('detailTitle').textContent=c.company+' — '+c.subject;
+  $('detailBody').innerHTML=`<div class="muted" style="font-size:14px;line-height:1.8"><b>Reclamante:</b> ${esc(c.claimant_name)}<br><b>Status:</b> ${esc(c.status)}<br><b>Plataforma:</b> ${esc(c.platform||'—')}<br><b>Protocolo:</b> ${esc(c.protocol||'—')}<br><b>Data:</b> ${fmt(c.complaint_date)}<br><b>Prazo:</b> ${fmt(c.deadline)}<br><b>Valor envolvido:</b> ${money(c.amount_involved)}<br><b>Valor recuperado:</b> ${money(c.amount_recovered)}<br><b>Próxima ação:</b> ${esc(c.next_action||'—')}<br><b>Observações:</b> ${esc(c.notes||'—')}</div>
+  <h3>Prints e anexos</h3>
+  <input id="attachmentInput" type="file" accept="image/jpeg,image/png,image/webp" multiple style="display:none" onchange="uploadAttachments('${id}',this)">
+  <div class="actions"><button class="btn soft" onclick="document.getElementById('attachmentInput').click()">+ Adicionar prints</button></div>
+  <div class="list">${attachments.length?attachments.map(a=>`<div class="card row"><span>${esc(a.file_name)}</span><div class="actions" style="margin:0"><button class="btn soft" onclick="openAttachment('${a.id}')">Abrir</button><button class="btn danger" onclick="deleteAttachment('${a.id}','${id}','${esc(a.storage_path)}')">Excluir</button></div></div>`).join(''):'<div class="muted">Nenhum print anexado.</div>'}</div>
+  <h3>Linha do tempo</h3><div class="timeline">${(tr.data||[]).length?(tr.data||[]).map(e=>`<div class="event"><b>${fmt(e.event_date)} — ${esc(e.title)}</b><div class="muted">${esc(e.details||'')}</div><button class="btn danger" style="padding:6px 8px;margin-top:5px" onclick="deleteEvent('${e.id}','${id}')">Excluir</button></div>`).join(''):'<div class="muted">Nenhuma atualização.</div>'}</div>
+  <div class="actions"><button class="btn primary" onclick="startEdit('${id}')">Editar informações</button><button class="btn soft" onclick="addEvent('${id}')">+ Atualização</button><button class="btn soft" onclick="emailComplaint('${id}')">Enviar resumo por e-mail</button><button class="btn danger" onclick="deleteComplaint('${id}')">Excluir reclamação</button></div>`;
+  detailDialog.showModal();
+};
